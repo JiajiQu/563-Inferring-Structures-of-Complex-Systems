@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""
+MNIST digit–pair classification via PCA + Random Fourier Features + Ridge
+------------------------------------------------------------------------
+• reads  mnist_train.csv, mnist_test.csv   (Kaggle format: header row, 'label' col)
+• for each digit pair  (1,9), (3,8), (1,7), (5,2):
+    – StandardScaler + PCA (95% var, randomized)
+    – RBF feature map via RBFSampler (n_components=500)
+    – RidgeClassifier on those features
+    – RandomizedSearchCV over {gamma, alpha}
+    – report CV & test accuracy and save 2-PC scatter plots
+"""
+
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition  import PCA
+from sklearn.kernel_approximation import RBFSampler
+from sklearn.linear_model    import RidgeClassifier
+from sklearn.pipeline        import Pipeline
+from sklearn.model_selection import RandomizedSearchCV, StratifiedKFold
+from sklearn.metrics         import accuracy_score, make_scorer
+
+# --------------- CONFIG --------------- #
+TRAIN_CSV   = Path("mnist_train.csv")
+TEST_CSV    = Path("mnist_test.csv")
+DIGIT_PAIRS = [(1,9),(3,8),(1,7),(5,2)]
+
+PCA_VAR      = 0.95      # keep 95% variance
+RFF_DIMS     = 500       # number of random Fourier features
+CV_FOLDS     = 3         # cross-val folds
+N_ITERS      = 6         # draws in RandomizedSearch
+RANDOM_STATE = 0
+FIG_DIR      = Path("figs_rff")
+FIG_DIR.mkdir(exist_ok=True)
+
+# hyper-parameter space for RFF + RidgeClassifier
+param_dist = {
+    "rff__gamma": [0.01, 0.05, 0.1, "scale"],
+    "clf__alpha": [1e-3, 1e-2, 1e-1, 1, 10]
+}
+
+ACC = make_scorer(lambda y, ypred: accuracy_score(y, ypred), greater_is_better=True)
+
+# ------------- HELPERS ------------- #
+def load_mnist(path):
+    df = pd.read_csv(path)
+    y  = df["label"].astype(int).values
+    X  = df.drop("label", axis=1).values.astype(float)/255.0
+    return X, y
+
+def subset_pair(X, y, a,b):
+    mask = (y==a)|(y==b)
+    Xp = X[mask]
+    yp = (y[mask]==b).astype(int)
+    return Xp, yp
+
+# ------------- CORE EXPERIMENT ------------- #
+def run_pair(pair, Xtr, ytr, Xte, yte):
+    a,b = pair
+    Xtrp, ytrp = subset_pair(Xtr,ytr,a,b)
+    Xtep, ytep = subset_pair(Xte,yte,a,b)
+
+    # pipeline: scale → PCA → RFF → Ridge
+    pipe = Pipeline([
+        ("scaler", StandardScaler()),
+        ("pca",    PCA(n_components=PCA_VAR,
+                       svd_solver="auto",
+                       random_state=RANDOM_STATE)),
+        ("rff",    RBFSampler(n_components=RFF_DIMS,
+                              random_state=RANDOM_STATE)),
+        ("clf",    RidgeClassifier())
+    ])
+
+    search = RandomizedSearchCV(
+        pipe, param_distributions=param_dist,
+        n_iter=N_ITERS, cv=StratifiedKFold(CV_FOLDS, shuffle=True, random_state=RANDOM_STATE),
+        scoring=ACC, n_jobs=-1, random_state=RANDOM_STATE
+    )
+    search.fit(Xtrp, ytrp)
+
+    best   = search.best_estimator_
+    npcs   = best.named_steps["pca"].n_components_
+    acc_cv = search.best_score_
+    acc_te = accuracy_score(ytep, best.predict(Xtep))
+
+    # quick 2-PC scatter of test set
+    Z2 = best.named_steps["pca"].transform(Xtep)[:,:2]
+    plt.figure(figsize=(4,4))
+    plt.scatter(Z2[:,0], Z2[:,1], c=ytep, cmap="coolwarm", s=8, alpha=0.5)
+    plt.title(f"{a} vs {b} (RFF, γ={search.best_params_['rff__gamma']}, α={search.best_params_['clf__alpha']})")
+    plt.xlabel("PC1"); plt.ylabel("PC2"); plt.tight_layout()
+    plt.savefig(FIG_DIR/f"{a}{b}_rff.pdf")
+    plt.close()
+
+    return npcs, search.best_params_, acc_cv, acc_te
+
+# ------------- MAIN ------------- #
+def main():
+    Xtr,ytr = load_mnist(TRAIN_CSV)
+    Xte,yte = load_mnist(TEST_CSV)
+
+    header = f"{'pair':<7}{'PCs':<5}{'gamma':<8}{'alpha':<8}{'CV acc':<8}{'test acc'}"
+    print(header); print("-"*len(header))
+
+    for pair in DIGIT_PAIRS:
+        npcs, bestp, cvacc, teacc = run_pair(pair, Xtr,ytr, Xte,yte)
+        print(f"{str(pair):<7}{npcs:<5}{bestp['rff__gamma']:<8}{bestp['clf__alpha']:<8}{cvacc:.3f}   {teacc:.3f}")
+
+if __name__=="__main__":
+    main()
